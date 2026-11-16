@@ -1,0 +1,6 @@
+.superpowers/
+配置.ini
+日志.txt
+状态/
+__pycache__/
+spike/
