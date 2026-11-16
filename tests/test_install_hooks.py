@@ -196,18 +196,18 @@ class WriteSettingsFileTest(unittest.TestCase):
         write_settings_file(self.ini_path, "https://open.feishu.cn/open-apis/bot/v2/hook/abc")
         self.assertEqual(read_settings(self.ini_path), {
             "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/abc",
-            "task_seconds_threshold": 120, "idle_seconds_threshold": 180, "summary_char_limit": 100})
+            "task_seconds_threshold": 300, "idle_seconds_threshold": 180, "summary_char_limit": 100})
         self.assertEqual(stat.S_IMODE(os.stat(self.ini_path).st_mode), 0o600)
 
     def test_write_settings_file_keeps_user_numbers_and_comments(self):
         write_settings_file(self.ini_path, "https://open.feishu.cn/open-apis/bot/v2/hook/abc")
         with open(self.ini_path, encoding="utf-8") as ini_file:
-            edited = ini_file.read().replace("任务时长门槛秒 = 120", "任务时长门槛秒 = 300")
+            edited = ini_file.read().replace("任务时长门槛秒 = 300", "任务时长门槛秒 = 600")
         with open(self.ini_path, "w", encoding="utf-8") as ini_file:
             ini_file.write(edited)
         write_settings_file(self.ini_path, "https://open.feishu.cn/open-apis/bot/v2/hook/new")
         settings = read_settings(self.ini_path)
-        self.assertEqual(settings["task_seconds_threshold"], 300)
+        self.assertEqual(settings["task_seconds_threshold"], 600)
         self.assertEqual(settings["webhook_url"], "https://open.feishu.cn/open-apis/bot/v2/hook/new")
         self.assertEqual(stat.S_IMODE(os.stat(self.ini_path).st_mode), 0o600)
         with open(self.ini_path, encoding="utf-8") as ini_file:
