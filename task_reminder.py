@@ -4,10 +4,14 @@
     python3 task_reminder.py <claude|codex> <turn-start|turn-end|needs-approval>
 """
 import configparser
+import json
 import os
 import re
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 
 INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(INSTALL_DIR, "配置.ini")
@@ -147,3 +151,45 @@ def build_message(tool_label, event_kind, cwd, elapsed_seconds, summary):
     if summary:
         return first_line + "\n" + summary_prefix + summary
     return first_line
+
+
+class FeishuSendError(Exception):
+    """飞书消息没发出去：网络不通、HTTP 出错，或飞书返回了错误码。"""
+
+
+def send_feishu_text(webhook_url, text):
+    """往飞书群机器人发一条文字消息；不成功就抛 FeishuSendError。"""
+    request_body = json.dumps({"msg_type": "text", "content": {"text": text}}).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url, data=request_body, headers={"Content-Type": "application/json"})
+    # 这台机器走代理而飞书在国内：空的 ProxyHandler 表示不用任何代理，直连
+    direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with direct_opener.open(request, timeout=10) as response:
+            reply_text = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as http_error:
+        error_text = http_error.read().decode("utf-8", errors="replace")[:200]
+        raise FeishuSendError("飞书返回 HTTP %d：%s" % (http_error.code, error_text))
+    except (urllib.error.URLError, socket.timeout) as network_error:
+        raise FeishuSendError("连不上飞书：%s" % network_error)
+    try:
+        reply = json.loads(reply_text)
+    except ValueError:
+        raise FeishuSendError("飞书的回复不是 JSON：%s" % reply_text[:200])
+    if not isinstance(reply, dict) or reply.get("code") != 0:
+        raise FeishuSendError("飞书拒收：%s" % reply_text[:200])
+
+
+def send_with_retry(webhook_url, text, attempts=3, wait_seconds=5):
+    """发飞书，失败就隔几秒重试；全部失败后写日志并在 Mac 上弹窗。返回是否发成功。"""
+    for attempt_number in range(1, attempts + 1):
+        try:
+            send_feishu_text(webhook_url, text)
+            return True
+        except FeishuSendError as send_error:
+            last_reason = str(send_error)
+            if attempt_number < attempts:
+                time.sleep(wait_seconds)
+    write_log_line(LOG_PATH, "飞书提醒发送失败（已试 %d 次）：%s｜消息：%s" % (attempts, last_reason, text))
+    show_mac_alert("飞书提醒发送失败：%s" % last_reason)
+    return False
