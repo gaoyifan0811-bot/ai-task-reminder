@@ -1,7 +1,7 @@
 """AI 任务完成提醒：Claude Code 和 Codex 的钩子调用本脚本，由它决定是否往飞书发提醒。
 
 用法（由钩子自动调用，不需要手动运行）：
-    python3 task_reminder.py <claude|codex> <turn-start|turn-end|needs-approval>
+    python3 task_reminder.py <claude|codex> <turn-start|turn-end|needs-approval|tool-finished>
 """
 import configparser
 import json
@@ -9,7 +9,9 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 
@@ -193,3 +195,140 @@ def send_with_retry(webhook_url, text, attempts=3, wait_seconds=5):
     write_log_line(LOG_PATH, "飞书提醒发送失败（已试 %d 次）：%s｜消息：%s" % (attempts, last_reason, text))
     show_mac_alert("飞书提醒发送失败：%s" % last_reason)
     return False
+
+
+def waiting_mark_file_path(state_dir, session_id):
+    return turn_start_file_path(state_dir, session_id)[:-len(".txt")] + ".等待批准.txt"
+
+
+def mark_waiting_for_approval(state_dir, session_id, now_timestamp):
+    """记下「这个会话正卡在等批准上」，以及是从什么时候开始等的。"""
+    os.makedirs(state_dir, exist_ok=True)
+    with open(waiting_mark_file_path(state_dir, session_id), "w", encoding="utf-8") as mark_file:
+        mark_file.write(repr(now_timestamp))
+
+
+def clear_waiting_for_approval(state_dir, session_id):
+    """会话继续往下走了（工具执行完、一轮结束或用户发了新指令），不再算等批准。"""
+    mark_path = waiting_mark_file_path(state_dir, session_id)
+    if os.path.exists(mark_path):
+        os.remove(mark_path)
+
+
+def waiting_for_approval_since(state_dir, session_id):
+    """这个会话从什么时候开始等批准；没在等则返回 None。"""
+    mark_path = waiting_mark_file_path(state_dir, session_id)
+    if not os.path.exists(mark_path):
+        return None
+    with open(mark_path, encoding="utf-8") as mark_file:
+        return float(mark_file.read())
+
+
+def summary_source_from_hook(event_kind, hook_input):
+    """从钩子给的信息里挑出要放进提醒的那段文字；没有可用的就返回 None。"""
+    if event_kind == "turn-end":
+        return hook_input.get("last_assistant_message")
+    tool_input = hook_input.get("tool_input") or {}
+    if event_kind == "asks-question":
+        questions = tool_input.get("questions") or []
+        if questions:
+            return questions[0].get("question")
+        return None
+    return tool_input.get("command") or hook_input.get("tool_name")
+
+
+def decide_delivery(event_kind, elapsed_seconds, idle_seconds, settings):
+    """返回 0 表示立刻发；正数表示过这么多秒再看一次；None 表示不发。"""
+    if should_notify(elapsed_seconds, idle_seconds, settings):
+        return 0
+    if event_kind in ("needs-approval", "asks-question"):
+        return settings["idle_seconds_threshold"]
+    return None
+
+
+def start_background_delivery(text, recheck_after_seconds, session_id):
+    """另起一个脱离钩子的后台进程去发送，钩子本身立刻返回，不拖慢 AI。"""
+    delivery_order = json.dumps(
+        {"text": text, "recheck_after_seconds": recheck_after_seconds, "session_id": session_id})
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "deliver", delivery_order],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def deliver(text, recheck_after_seconds, session_id):
+    """后台进程做的事：立刻发；或者等一会儿，那次批准请求还没人理才发。"""
+    if recheck_after_seconds > 0:
+        waiting_since = waiting_for_approval_since(STATE_DIR, session_id)
+        time.sleep(recheck_after_seconds)
+        still_waiting_since = waiting_for_approval_since(STATE_DIR, session_id)
+        if still_waiting_since is None or still_waiting_since != waiting_since:
+            return
+    send_with_retry(read_settings(SETTINGS_PATH)["webhook_url"], text)
+
+
+TOOL_LABELS = {"claude": "Claude Code", "codex": "Codex"}
+HOOK_EVENTS = ("turn-start", "turn-end", "needs-approval", "tool-finished")
+
+
+def report_problem(text):
+    """工具自己出了问题：写日志并在 Mac 上弹窗，绝不悄悄失败。"""
+    write_log_line(LOG_PATH, text)
+    show_mac_alert(text)
+
+
+def main(argv, stdin_text):
+    """钩子入口。无论如何都返回 0，不能让提醒工具的问题打断 AI。"""
+    if len(argv) != 2 or argv[0] not in TOOL_LABELS or argv[1] not in HOOK_EVENTS:
+        report_problem("提醒脚本收到了不认识的参数：%s" % " ".join(argv))
+        return 0
+    tool, event = argv
+    try:
+        hook_input = json.loads(stdin_text)
+    except ValueError:
+        report_problem("钩子传来的内容不是 JSON：%s" % stdin_text[:100])
+        return 0
+    for required_field in ("session_id", "cwd"):
+        if not isinstance(hook_input, dict) or not hook_input.get(required_field):
+            report_problem("钩子传来的内容里缺少 %s：%s" % (required_field, stdin_text[:100]))
+            return 0
+    session_id = hook_input["session_id"]
+    now_timestamp = time.time()
+
+    clear_waiting_for_approval(STATE_DIR, session_id)
+    if event == "tool-finished":
+        return 0
+    if event == "turn-start":
+        record_turn_start(STATE_DIR, session_id, now_timestamp)
+        return 0
+
+    try:
+        settings = read_settings(SETTINGS_PATH)
+    except ReminderSettingsError as settings_error:
+        report_problem(str(settings_error))
+        return 0
+    if event == "needs-approval" and hook_input.get("tool_name") == "AskUserQuestion":
+        event = "asks-question"
+    elapsed_seconds = turn_elapsed_seconds(STATE_DIR, session_id, now_timestamp)
+    recheck_after_seconds = decide_delivery(event, elapsed_seconds, keyboard_mouse_idle_seconds(), settings)
+    if event != "turn-end":
+        mark_waiting_for_approval(STATE_DIR, session_id, now_timestamp)
+    if recheck_after_seconds is None:
+        return 0
+    summary = one_line_summary(summary_source_from_hook(event, hook_input), settings["summary_char_limit"])
+    text = build_message(TOOL_LABELS[tool], event, hook_input["cwd"], elapsed_seconds, summary)
+    start_background_delivery(text, recheck_after_seconds, session_id)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == "deliver":
+            delivery_order = json.loads(sys.argv[2])
+            deliver(delivery_order["text"], delivery_order["recheck_after_seconds"], delivery_order["session_id"])
+        else:
+            main(sys.argv[1:], sys.stdin.read())
+    except Exception:
+        # 唯一的兜底：钩子不能让 AI 那一轮失败，但错误必须留痕并让人看见
+        report_problem("提醒脚本出错：%s" % traceback.format_exc()[-300:])
+    sys.exit(0)
