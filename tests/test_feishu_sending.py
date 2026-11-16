@@ -1,3 +1,4 @@
+import http.client
 import http.server
 import json
 import os
@@ -63,6 +64,23 @@ class SendFeishuTextTest(unittest.TestCase):
         with self.assertRaises(FeishuSendError) as caught:
             send_feishu_text(url, "你好")
         self.assertIn("登录页", str(caught.exception))
+
+    def test_send_feishu_text_ignores_proxy_settings(self):
+        url, received_bodies, server = start_local_feishu_stub(200, '{"code": 0}')
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        dead_proxy = {"http_proxy": "http://127.0.0.1:1", "https_proxy": "http://127.0.0.1:1", "no_proxy": ""}
+        with mock.patch.dict(os.environ, dead_proxy):
+            send_feishu_text(url, "你好")
+        self.assertEqual(len(received_bodies), 1)
+
+    def test_send_feishu_text_wraps_dropped_connection(self):
+        dropped = mock.Mock()
+        dropped.open.side_effect = http.client.RemoteDisconnected("对方挂断")
+        with mock.patch.object(task_reminder.urllib.request, "build_opener", return_value=dropped):
+            with self.assertRaises(FeishuSendError) as caught:
+                send_feishu_text("http://127.0.0.1:9/hook", "你好")
+        self.assertIn("对方挂断", str(caught.exception))
 
     def test_send_feishu_text_raises_when_nothing_listens(self):
         with self.assertRaises(FeishuSendError):

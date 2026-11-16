@@ -4,10 +4,10 @@
     python3 task_reminder.py <claude|codex> <turn-start|turn-end|needs-approval|tool-finished>
 """
 import configparser
+import http.client
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -72,7 +72,7 @@ def show_mac_alert(text):
     """在 Mac 右上角弹一条系统通知。"""
     quoted_text = text.replace("\\", "\\\\").replace('"', '\\"')
     script = 'display notification "%s" with title "AI 任务提醒" sound name "Basso"' % quoted_text
-    subprocess.run(["/usr/bin/osascript", "-e", script], check=True)
+    subprocess.run(["/usr/bin/osascript", "-e", script], check=True, timeout=5)
 
 
 def turn_start_file_path(state_dir, session_id):
@@ -97,6 +97,14 @@ def turn_elapsed_seconds(state_dir, session_id, now_timestamp):
         return now_timestamp - float(start_file.read())
 
 
+def forget_turn_start(state_dir, session_id):
+    """一轮结束后删掉开始记录：AI 之后被后台任务自己唤醒的那一轮，就不会从很久以前算起。"""
+    try:
+        os.remove(turn_start_file_path(state_dir, session_id))
+    except FileNotFoundError:
+        return  # 本来就没有记录（比如安装前就开始的会话）
+
+
 def parse_hid_idle_seconds(ioreg_output):
     """从 ioreg 的输出里取出键盘鼠标空闲时间（原始单位是纳秒）。"""
     found = re.search(r'"HIDIdleTime" = (\d+)', ioreg_output)
@@ -108,7 +116,7 @@ def parse_hid_idle_seconds(ioreg_output):
 def keyboard_mouse_idle_seconds():
     """键盘鼠标已经多少秒没动过。"""
     ioreg = subprocess.run(["/usr/sbin/ioreg", "-c", "IOHIDSystem"],
-                           capture_output=True, text=True, check=True)
+                           capture_output=True, text=True, check=True, timeout=2)
     return parse_hid_idle_seconds(ioreg.stdout)
 
 
@@ -172,8 +180,9 @@ def send_feishu_text(webhook_url, text):
     except urllib.error.HTTPError as http_error:
         error_text = http_error.read().decode("utf-8", errors="replace")[:200]
         raise FeishuSendError("飞书返回 HTTP %d：%s" % (http_error.code, error_text))
-    except (urllib.error.URLError, socket.timeout) as network_error:
-        raise FeishuSendError("连不上飞书：%s" % network_error)
+    except (OSError, http.client.HTTPException) as network_error:
+        # 断网、超时、连接中途被挂断都算在这里，交给外层重试
+        raise FeishuSendError("连不上飞书：%r" % network_error)
     try:
         reply = json.loads(reply_text)
     except ValueError:
@@ -198,43 +207,62 @@ def send_with_retry(webhook_url, text, attempts=3, wait_seconds=5):
 
 
 def waiting_mark_file_path(state_dir, session_id):
-    return turn_start_file_path(state_dir, session_id)[:-len(".txt")] + ".等待批准.txt"
+    return turn_start_file_path(state_dir, session_id)[:-len(".txt")] + ".等待批准.json"
 
 
-def mark_waiting_for_approval(state_dir, session_id, now_timestamp):
-    """记下「这个会话正卡在等批准上」，以及是从什么时候开始等的。"""
+def read_waiting_mark(state_dir, session_id):
+    """读「正在等批准」的标记：{"since": 开始等的时间, "tool_name": 等批准的工具}；没在等返回 None。"""
+    try:
+        with open(waiting_mark_file_path(state_dir, session_id), encoding="utf-8") as mark_file:
+            return json.load(mark_file)
+    except FileNotFoundError:
+        return None
+
+
+def mark_waiting_for_approval(state_dir, session_id, now_timestamp, tool_name):
+    """记下「这个会话正卡在等批准上」：从什么时候开始、等的是哪个工具。"""
     os.makedirs(state_dir, exist_ok=True)
     with open(waiting_mark_file_path(state_dir, session_id), "w", encoding="utf-8") as mark_file:
-        mark_file.write(repr(now_timestamp))
+        json.dump({"since": now_timestamp, "tool_name": tool_name}, mark_file, ensure_ascii=False)
 
 
-def clear_waiting_for_approval(state_dir, session_id):
-    """会话继续往下走了（工具执行完、一轮结束或用户发了新指令），不再算等批准。"""
-    mark_path = waiting_mark_file_path(state_dir, session_id)
-    if os.path.exists(mark_path):
-        os.remove(mark_path)
+def clear_waiting_for_approval(state_dir, session_id, finished_tool_name=None):
+    """会话继续往下走了，不再算等批准。
+
+    给了 finished_tool_name 时，只有等批准的正是这个工具才清掉——
+    否则同时在跑的别的工具（比如自动放行的读文件）一完成，就会把标记误清。
+    """
+    if finished_tool_name is not None:
+        mark = read_waiting_mark(state_dir, session_id)
+        if mark is not None and mark["tool_name"] not in (None, finished_tool_name):
+            return
+    try:
+        os.remove(waiting_mark_file_path(state_dir, session_id))
+    except FileNotFoundError:
+        return  # 本来就没在等，或者刚被另一个钩子清掉
 
 
 def waiting_for_approval_since(state_dir, session_id):
     """这个会话从什么时候开始等批准；没在等则返回 None。"""
-    mark_path = waiting_mark_file_path(state_dir, session_id)
-    if not os.path.exists(mark_path):
+    mark = read_waiting_mark(state_dir, session_id)
+    if mark is None:
         return None
-    with open(mark_path, encoding="utf-8") as mark_file:
-        return float(mark_file.read())
+    return mark["since"]
 
 
 def summary_source_from_hook(event_kind, hook_input):
     """从钩子给的信息里挑出要放进提醒的那段文字；没有可用的就返回 None。"""
     if event_kind == "turn-end":
-        return hook_input.get("last_assistant_message")
-    tool_input = hook_input.get("tool_input") or {}
-    if event_kind == "asks-question":
-        questions = tool_input.get("questions") or []
-        if questions:
-            return questions[0].get("question")
-        return None
-    return tool_input.get("command") or hook_input.get("tool_name")
+        source = hook_input.get("last_assistant_message")
+    elif event_kind == "asks-question":
+        questions = (hook_input.get("tool_input") or {}).get("questions") or []
+        source = questions[0].get("question") if questions else None
+    else:
+        source = (hook_input.get("tool_input") or {}).get("command") or hook_input.get("tool_name")
+    if source is None or isinstance(source, str):
+        return source
+    # 有的工具把命令给成列表而不是一段文字
+    return json.dumps(source, ensure_ascii=False)
 
 
 def decide_delivery(event_kind, elapsed_seconds, idle_seconds, settings):
@@ -246,24 +274,37 @@ def decide_delivery(event_kind, elapsed_seconds, idle_seconds, settings):
     return None
 
 
-def start_background_delivery(text, recheck_after_seconds, session_id):
+def start_background_delivery(text, recheck_after_seconds, session_id, waiting_since):
     """另起一个脱离钩子的后台进程去发送，钩子本身立刻返回，不拖慢 AI。"""
-    delivery_order = json.dumps(
-        {"text": text, "recheck_after_seconds": recheck_after_seconds, "session_id": session_id})
+    delivery_order = json.dumps({
+        "text": text, "recheck_after_seconds": recheck_after_seconds,
+        "session_id": session_id, "waiting_since": waiting_since})
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "deliver", delivery_order],
         start_new_session=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def deliver(text, recheck_after_seconds, session_id):
-    """后台进程做的事：立刻发；或者等一会儿，那次批准请求还没人理才发。"""
+# 等批准的补查最多盯这么久；人一直在电脑前却不理，Mac 自带的弹窗已经提醒过了
+RECHECK_GIVE_UP_SECONDS = 1800
+
+
+def deliver(text, recheck_after_seconds, session_id, waiting_since):
+    """后台进程做的事：立刻发；或者是等批准的补查——那次请求还卡着、人也确实不在，才发。"""
     if recheck_after_seconds > 0:
-        waiting_since = waiting_for_approval_since(STATE_DIR, session_id)
-        time.sleep(recheck_after_seconds)
-        still_waiting_since = waiting_for_approval_since(STATE_DIR, session_id)
-        if still_waiting_since is None or still_waiting_since != waiting_since:
-            return
+        give_up_at = time.time() + RECHECK_GIVE_UP_SECONDS
+        seconds_to_wait = recheck_after_seconds
+        while True:
+            time.sleep(seconds_to_wait)
+            if waiting_for_approval_since(STATE_DIR, session_id) != waiting_since:
+                return  # 已经批准或拒绝了，或者换成了更新的一次请求
+            idle_seconds = keyboard_mouse_idle_seconds()
+            if idle_seconds >= recheck_after_seconds:
+                break
+            if time.time() > give_up_at:
+                return
+            # 人刚才还在动键鼠：等到「如果从此不动」正好满门槛的那一刻再看
+            seconds_to_wait = max(recheck_after_seconds - idle_seconds, 10.0)
     send_with_retry(read_settings(SETTINGS_PATH)["webhook_url"], text)
 
 
@@ -288,36 +329,44 @@ def main(argv, stdin_text):
     except ValueError:
         report_problem("钩子传来的内容不是 JSON：%s" % stdin_text[:100])
         return 0
-    for required_field in ("session_id", "cwd"):
-        if not isinstance(hook_input, dict) or not hook_input.get(required_field):
-            report_problem("钩子传来的内容里缺少 %s：%s" % (required_field, stdin_text[:100]))
-            return 0
+    if not isinstance(hook_input, dict) or not hook_input.get("session_id"):
+        report_problem("钩子传来的内容里缺少 session_id：%s" % stdin_text[:100])
+        return 0
     session_id = hook_input["session_id"]
     now_timestamp = time.time()
 
-    clear_waiting_for_approval(STATE_DIR, session_id)
     if event == "tool-finished":
+        clear_waiting_for_approval(STATE_DIR, session_id, hook_input.get("tool_name"))
         return 0
     if event == "turn-start":
+        clear_waiting_for_approval(STATE_DIR, session_id)
         record_turn_start(STATE_DIR, session_id, now_timestamp)
         return 0
 
+    if not hook_input.get("cwd"):
+        report_problem("钩子传来的内容里缺少 cwd：%s" % stdin_text[:100])
+        return 0
     try:
         settings = read_settings(SETTINGS_PATH)
     except ReminderSettingsError as settings_error:
         report_problem(str(settings_error))
         return 0
-    if event == "needs-approval" and hook_input.get("tool_name") == "AskUserQuestion":
-        event = "asks-question"
     elapsed_seconds = turn_elapsed_seconds(STATE_DIR, session_id, now_timestamp)
+    if event == "turn-end":
+        clear_waiting_for_approval(STATE_DIR, session_id)
+        forget_turn_start(STATE_DIR, session_id)
+        waiting_since = None
+    else:
+        mark_waiting_for_approval(STATE_DIR, session_id, now_timestamp, hook_input.get("tool_name"))
+        waiting_since = now_timestamp
+        if hook_input.get("tool_name") == "AskUserQuestion":
+            event = "asks-question"
     recheck_after_seconds = decide_delivery(event, elapsed_seconds, keyboard_mouse_idle_seconds(), settings)
-    if event != "turn-end":
-        mark_waiting_for_approval(STATE_DIR, session_id, now_timestamp)
     if recheck_after_seconds is None:
         return 0
     summary = one_line_summary(summary_source_from_hook(event, hook_input), settings["summary_char_limit"])
     text = build_message(TOOL_LABELS[tool], event, hook_input["cwd"], elapsed_seconds, summary)
-    start_background_delivery(text, recheck_after_seconds, session_id)
+    start_background_delivery(text, recheck_after_seconds, session_id, waiting_since)
     return 0
 
 
@@ -325,10 +374,15 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) == 3 and sys.argv[1] == "deliver":
             delivery_order = json.loads(sys.argv[2])
-            deliver(delivery_order["text"], delivery_order["recheck_after_seconds"], delivery_order["session_id"])
+            deliver(delivery_order["text"], delivery_order["recheck_after_seconds"],
+                    delivery_order["session_id"], delivery_order["waiting_since"])
         else:
             main(sys.argv[1:], sys.stdin.read())
     except Exception:
         # 唯一的兜底：钩子不能让 AI 那一轮失败，但错误必须留痕并让人看见
-        report_problem("提醒脚本出错：%s" % traceback.format_exc()[-300:])
+        try:
+            report_problem("提醒脚本出错：%s" % traceback.format_exc()[-300:])
+        except Exception:
+            # 连日志和弹窗都不行了（磁盘满、弹窗超时等）：写到标准错误，那里允许输出
+            sys.stderr.write(traceback.format_exc())
     sys.exit(0)

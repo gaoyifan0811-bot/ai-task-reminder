@@ -65,8 +65,22 @@ def validate_webhook_url(url):
         % (FEISHU_WEBHOOK_PREFIXES[0], url.strip()))
 
 
+MOVED_FOLDER_ALERT_SCRIPT = (
+    'display notification "找不到提醒脚本（文件夹是不是挪过位置？）请重新双击「安装.command」" '
+    'with title "AI 任务提醒" sound name "Basso"')
+
+
 def reminder_hook_command(script_path, tool, event_kind):
-    return "/usr/bin/python3 %s %s %s" % (shlex.quote(script_path), tool, event_kind)
+    """钩子里要运行的那条命令。
+
+    结尾的 || true 很要紧：文件夹被挪走或删掉后，python 会因为找不到脚本而以 2 退出，
+    而退出码 2 在两个工具里都表示「拦下这一步」，会把 AI 卡死。
+    只在「用户发出指令」这一个事件上弹窗提示重装，其他事件不弹，免得一直刷屏。
+    """
+    command = "/usr/bin/python3 %s %s %s" % (shlex.quote(script_path), tool, event_kind)
+    if event_kind == "turn-start":
+        command += " || /usr/bin/osascript -e %s" % shlex.quote(MOVED_FOLDER_ALERT_SCRIPT)
+    return command + " || true"
 
 
 def remove_reminder_hooks(hooks_config):
@@ -112,12 +126,31 @@ def write_settings_file(ini_path, webhook_url):
     os.chmod(ini_path, 0o600)
 
 
+class HookFileError(Exception):
+    """钩子配置文件读不懂，不敢改它。"""
+
+
 def read_hook_file(hook_file_path):
-    """读钩子配置文件；文件不存在时当作空的。"""
+    """读钩子配置文件并检查结构；文件不存在时当作空的。读不懂就报错，绝不硬改。"""
     if not os.path.exists(hook_file_path):
         return {}
     with open(hook_file_path, encoding="utf-8") as hook_file:
-        return json.load(hook_file)
+        try:
+            file_content = json.load(hook_file)
+        except json.JSONDecodeError as broken_json:
+            raise HookFileError("配置文件 %s 不是合法的 JSON（%s），没有改动它。请先修好这个文件。"
+                                % (hook_file_path, broken_json))
+    hooks_config = file_content.get("hooks", {}) if isinstance(file_content, dict) else None
+    shape_is_expected = isinstance(hooks_config, dict) and all(
+        isinstance(groups, list) and all(
+            isinstance(group, dict) and isinstance(group.get("hooks", []), list) and all(
+                isinstance(hook, dict) and isinstance(hook.get("command", ""), str)
+                for hook in group.get("hooks", []))
+            for group in groups)
+        for groups in hooks_config.values())
+    if not shape_is_expected:
+        raise HookFileError("配置文件 %s 里钩子部分的结构和预期不一样，没有改动它。" % hook_file_path)
+    return file_content
 
 
 def back_up_then_write_hook_file(hook_file_path, file_content):
@@ -130,6 +163,7 @@ def back_up_then_write_hook_file(hook_file_path, file_content):
         if os.path.exists(hook_file_path):
             os.remove(hook_file_path)
         return
+    os.makedirs(os.path.dirname(hook_file_path), exist_ok=True)
     with open(hook_file_path, "w", encoding="utf-8") as hook_file:
         json.dump(file_content, hook_file, ensure_ascii=False, indent=2)
         hook_file.write("\n")
@@ -163,8 +197,14 @@ def install():
   3. 安全设置选「自定义关键词」，添加两个关键词：Claude 和 Codex
   4. 复制它给出的 Webhook 地址
 """)
+    # 先把两个工具的配置都读一遍：有读不懂的就在动手之前停下，不会装到一半
+    new_file_contents = {}
+    for tool, hook_file_path in HOOK_FILES.items():
+        file_content = read_hook_file(hook_file_path)
+        file_content["hooks"] = add_reminder_hooks(file_content.get("hooks", {}), tool, REMINDER_SCRIPT_PATH)
+        new_file_contents[hook_file_path] = file_content
+
     webhook_url = ask_for_webhook_url()
-    write_settings_file(task_reminder.SETTINGS_PATH, webhook_url)
 
     print("\n第二步：发一条测试消息……")
     try:
@@ -178,10 +218,9 @@ def install():
         print("  请确认手机飞书的通知已打开、这个群没有设免打扰，然后重新双击安装。")
         return 1
 
+    write_settings_file(task_reminder.SETTINGS_PATH, webhook_url)
     print("\n第三步：接到 Claude Code 和 Codex 上……")
-    for tool, hook_file_path in HOOK_FILES.items():
-        file_content = read_hook_file(hook_file_path)
-        file_content["hooks"] = add_reminder_hooks(file_content.get("hooks", {}), tool, REMINDER_SCRIPT_PATH)
+    for hook_file_path, file_content in new_file_contents.items():
         back_up_then_write_hook_file(hook_file_path, file_content)
         print("  已写入：" + hook_file_path)
 
@@ -192,6 +231,9 @@ def install():
   打开 Codex 桌面 App →「设置 → Hooks」，把新出现的钩子点「信任」。
   （Codex 出于安全考虑，新钩子不点信任不会运行。Claude Code 不需要这一步。）
 
+如果哪天飞书发不出去，Mac 右上角会弹「飞书提醒发送失败」的通知。
+（这条通知是以「脚本编辑器」的名义弹的：系统设置 → 通知 里别把它关掉。）
+
 想调提醒的门槛：用文本编辑器打开本文件夹里的「配置.ini」。
 想停用：双击「卸载.command」。
 注意：这个文件夹挪了位置之后，要重新双击一次「安装.command」。
@@ -201,8 +243,8 @@ def install():
 
 def uninstall():
     print("\n=== 卸载 AI 任务完成提醒 ===\n")
-    for hook_file_path in HOOK_FILES.values():
-        file_content = read_hook_file(hook_file_path)
+    file_contents = {hook_file_path: read_hook_file(hook_file_path) for hook_file_path in HOOK_FILES.values()}
+    for hook_file_path, file_content in file_contents.items():
         if "hooks" not in file_content:
             print("  本来就没有钩子，不用改：" + hook_file_path)
             continue
@@ -219,8 +261,11 @@ def uninstall():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["install"]:
-        sys.exit(install())
-    if sys.argv[1:] == ["uninstall"]:
-        sys.exit(uninstall())
+    try:
+        if sys.argv[1:] == ["install"]:
+            sys.exit(install())
+        if sys.argv[1:] == ["uninstall"]:
+            sys.exit(uninstall())
+    except (HookFileError, task_reminder.ReminderSettingsError) as stop_reason:
+        sys.exit("✗ 已停止：%s" % stop_reason)
     sys.exit("用法：python3 install_hooks.py install 或 uninstall（收到的参数：%s）" % " ".join(sys.argv[1:]))
