@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import task_reminder
 from task_reminder import (
-    clear_waiting_for_approval, decide_delivery, deliver, main, mark_waiting_for_approval,
+    background_task_still_running, clear_waiting_for_approval, decide_delivery, deliver, main,
+    mark_waiting_for_approval,
     summary_source_from_hook, waiting_for_approval_since,
 )
 
@@ -47,6 +48,29 @@ class SummarySourceTest(unittest.TestCase):
                 "tool_input": {"questions": [{"question": "用哪种形态？"}, {"question": "第二问"}]}}
         self.assertEqual(summary_source_from_hook("asks-question", hook), "用哪种形态？")
         self.assertIsNone(summary_source_from_hook("asks-question", {"tool_input": {"questions": []}}))
+
+
+RUNNING_SUBAGENT = {"id": "a1", "type": "subagent", "status": "running", "description": "查资料"}
+
+
+class BackgroundTaskStillRunningTest(unittest.TestCase):
+    def test_running_task_means_not_finished(self):
+        self.assertTrue(background_task_still_running({"background_tasks": [RUNNING_SUBAGENT]}))
+
+    def test_no_task_or_only_finished_tasks_means_finished(self):
+        self.assertFalse(background_task_still_running({"background_tasks": []}))
+        self.assertFalse(background_task_still_running(
+            {"background_tasks": [dict(RUNNING_SUBAGENT, status="completed")]}))
+
+    def test_background_command_counts_but_monitor_does_not(self):
+        self.assertTrue(background_task_still_running(
+            {"background_tasks": [{"id": "b1", "type": "shell", "status": "running", "command": "跑回测"}]}))
+        self.assertFalse(background_task_still_running(
+            {"background_tasks": [{"id": "m1", "type": "monitor", "status": "running"}]}))
+
+    def test_missing_field_means_finished(self):
+        # Codex 的钩子没有这个字段：照旧每次停下都算跑完
+        self.assertFalse(background_task_still_running({}))
 
 
 class DecideDeliveryTest(unittest.TestCase):
@@ -136,6 +160,35 @@ class MainTest(unittest.TestCase):
         self.mock_idle.return_value = 600.0
         self.run_main_at(9000.0, ["claude", "turn-end"], hook)
         self.mock_start.assert_called_once_with("✅ Claude Code 跑完了｜项目甲", 0, "s1", None)
+
+    def test_main_turn_end_with_running_background_task_stays_silent(self):
+        hook = {"session_id": "s1", "cwd": "/Users/x/项目甲"}
+        self.mock_idle.return_value = 600.0
+        self.run_main_at(1000.0, ["claude", "turn-start"], hook)
+        self.run_main_at(1600.0, ["claude", "turn-end"],
+                         dict(hook, last_assistant_message="等子任务", background_tasks=[RUNNING_SUBAGENT]))
+        self.mock_start.assert_not_called()
+
+    def test_main_whole_task_duration_counts_from_first_prompt_across_background_waits(self):
+        hook = {"session_id": "s1", "cwd": "/Users/x/项目甲"}
+        self.run_main_at(1000.0, ["claude", "turn-start"], hook)
+        self.run_main_at(1060.0, ["claude", "turn-end"], dict(hook, background_tasks=[RUNNING_SUBAGENT]))
+        # 后台任务做完，AI 被自动唤醒：这也会触发一次「一轮开始」，但不该把开始时间重置
+        self.run_main_at(1900.0, ["claude", "turn-start"], hook)
+        self.run_main_at(1930.0, ["claude", "turn-end"],
+                         dict(hook, last_assistant_message="全部做完", background_tasks=[]))
+        self.mock_start.assert_called_once_with("✅ Claude Code 跑完了｜项目甲｜用时 15 分钟\n全部做完", 0, "s1", None)
+
+    def test_main_new_prompt_after_whole_task_finished_starts_timing_afresh(self):
+        hook = {"session_id": "s1", "cwd": "/Users/x/项目甲"}
+        self.run_main_at(1000.0, ["claude", "turn-start"], hook)
+        self.run_main_at(1060.0, ["claude", "turn-end"], dict(hook, background_tasks=[RUNNING_SUBAGENT]))
+        self.run_main_at(1900.0, ["claude", "turn-start"], hook)
+        self.run_main_at(1930.0, ["claude", "turn-end"], dict(hook, background_tasks=[]))
+        self.mock_start.reset_mock()
+        self.run_main_at(5000.0, ["claude", "turn-start"], hook)
+        self.run_main_at(5030.0, ["claude", "turn-end"], dict(hook, background_tasks=[]))
+        self.mock_start.assert_not_called()
 
     def test_main_tool_finished_does_not_need_cwd(self):
         self.assertEqual(main(["codex", "tool-finished"], json.dumps({"session_id": "s1"})), 0)

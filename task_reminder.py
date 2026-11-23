@@ -98,7 +98,7 @@ def turn_elapsed_seconds(state_dir, session_id, now_timestamp):
 
 
 def forget_turn_start(state_dir, session_id):
-    """一轮结束后删掉开始记录：AI 之后被后台任务自己唤醒的那一轮，就不会从很久以前算起。"""
+    """整件事做完后删掉开始记录，下一件事重新计时。"""
     try:
         os.remove(turn_start_file_path(state_dir, session_id))
     except FileNotFoundError:
@@ -204,6 +204,36 @@ def send_with_retry(webhook_url, text, attempts=3, wait_seconds=5):
     write_log_line(LOG_PATH, "飞书提醒发送失败（已试 %d 次）：%s｜消息：%s" % (attempts, last_reason, text))
     show_mac_alert("飞书提醒发送失败：%s" % last_reason)
     return False
+
+
+def background_task_still_running(hook_input):
+    """AI 这次停下时还有后台任务在跑：它只是先歇着，后台任务做完会被自动叫醒，整件事还没做完。
+
+    只有 Claude Code 的「停下」钩子带 background_tasks；没有这个字段（比如 Codex）就当作没有后台任务。
+    监视器（monitor）是一直开着盯某样东西的，不会「做完」，不算在内。
+    """
+    return any(task.get("status") == "running" and task.get("type") != "monitor"
+               for task in hook_input.get("background_tasks") or [])
+
+
+def background_wait_mark_file_path(state_dir, session_id):
+    return turn_start_file_path(state_dir, session_id)[:-len(".txt")] + ".等后台任务"
+
+
+def mark_waiting_for_background_task(state_dir, session_id):
+    """记下「这个会话停下只是在等后台任务」，下次被叫醒时不重新计时。"""
+    os.makedirs(state_dir, exist_ok=True)
+    with open(background_wait_mark_file_path(state_dir, session_id), "w", encoding="utf-8"):
+        pass
+
+
+def clear_background_wait_mark(state_dir, session_id):
+    """清掉「在等后台任务」的标记；返回清之前有没有这个标记。"""
+    try:
+        os.remove(background_wait_mark_file_path(state_dir, session_id))
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def waiting_mark_file_path(state_dir, session_id):
@@ -340,7 +370,10 @@ def main(argv, stdin_text):
         return 0
     if event == "turn-start":
         clear_waiting_for_approval(STATE_DIR, session_id)
-        record_turn_start(STATE_DIR, session_id, now_timestamp)
+        was_waiting_for_background_task = clear_background_wait_mark(STATE_DIR, session_id)
+        # 后台任务做完叫醒 AI 也算「一轮开始」，但整件事还是同一件，用时接着最初那条指令算
+        if not (was_waiting_for_background_task and turn_elapsed_seconds(STATE_DIR, session_id, now_timestamp) is not None):
+            record_turn_start(STATE_DIR, session_id, now_timestamp)
         return 0
 
     if not hook_input.get("cwd"):
@@ -354,6 +387,10 @@ def main(argv, stdin_text):
     elapsed_seconds = turn_elapsed_seconds(STATE_DIR, session_id, now_timestamp)
     if event == "turn-end":
         clear_waiting_for_approval(STATE_DIR, session_id)
+        if background_task_still_running(hook_input):
+            mark_waiting_for_background_task(STATE_DIR, session_id)
+            return 0  # 只做完了一小步，等整件事做完再提醒
+        clear_background_wait_mark(STATE_DIR, session_id)
         forget_turn_start(STATE_DIR, session_id)
         waiting_since = None
     else:
